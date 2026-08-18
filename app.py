@@ -5,7 +5,7 @@ import cv2
 import torch
 import timm
 import hashlib
-import urllib.request
+import requests
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -16,17 +16,16 @@ from pytorch_grad_cam import GradCAMPlusPlus, ScoreCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
 # ==========================================
-# 1. KONFIGURASI Halaman & PATH RELATIF
+# 1. KONFIGURASI HALAMAN & PATH RELATIF
 # ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-# URL GitHub Release & SHA256 Hash
+# URL GitHub Release & Checksum SHA-256 untuk MambaVision
+# ⚠️ PASTIKAN USERNAME_ANDA DAN NAMA_REPO_ANDA SESUAI DENGAN GITHUB ANDA
 MAMBA_URL = "https://github.com/maksum-rois/VMINet-MambaVisionXAISkinLesion/releases/download/v1/mambavision_best.pt"
 MAMBA_SHA256 = "2363e55448f8d8a1a998c9db95a21bf538a7dc7d7522004e7425ff9ef6c604aa"
-
-VMINET_URL = "https://github.com/maksum-rois/VMINet-MambaVisionXAISkinLesion/releases/download/v1/vminet_best.pt"
 
 st.set_page_config(
     page_title="Skin Lesion XAI Framework",
@@ -38,7 +37,7 @@ st.title("🔬 Framework Klasifikasi Lesi Kulit Berbasis Mamba & XAI")
 st.caption("Integrasi MambaVision/VMINet, Preprocessing DullRazor+CLAHE, dan Visual XAI (Grad-CAM++, Score-CAM)")
 
 # ==========================================
-# 2. VERIFIKASI HASH & DOWNLOAD OTOMATIS
+# 2. VERIFIKASI HASH & DOWNLOAD MAMBAVISION
 # ==========================================
 def verify_sha256(file_path, expected_hash):
     """Memeriksa integritas file berdasarkan nilai SHA256 checksum."""
@@ -50,23 +49,33 @@ def verify_sha256(file_path, expected_hash):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest().lower() == expected_hash.lower()
 
-def download_model_with_integrity_check(file_path, url, expected_sha256=None):
-    """Mengunduh file bobot model jika belum ada atau nilai Hash SHA256 tidak cocok."""
+def download_mambavision_model(file_path, url, expected_sha256=None):
+    """Mengunduh mambavision_best.pt dari GitHub Releases menggunakan requests jika belum ada."""
+    if os.path.exists(file_path) and expected_sha256 and verify_sha256(file_path, expected_sha256):
+        return  # File sudah ada dan valid
+    
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     filename = os.path.basename(file_path)
-    
-    # Cek ketersediaan dan validasi SHA256
-    if expected_sha256 and verify_sha256(file_path, expected_sha256):
-        return  # File sudah ada dan valid
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
     with st.spinner(f"📦 Mengunduh bobot model {filename} (~181 MB)... Mohon tunggu sebentar."):
         try:
-            urllib.request.urlretrieve(url, file_path)
+            response = requests.get(url, headers=headers, stream=True, allow_redirects=True)
+            if response.status_code == 200:
+                with open(file_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            else:
+                st.error(f"❌ Gagal mengunduh {filename}. HTTP Status: {response.status_code}. Pastikan Repository bersifat PUBLIC dan URL valid.")
+                return
+
             if expected_sha256 and not verify_sha256(file_path, expected_sha256):
                 st.error(f"❌ Korupsi file terdeteksi pada {filename}. Nilai SHA256 tidak cocok.")
-                os.remove(file_path)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
         except Exception as e:
-            st.error(f"❌ Gagal mengunduh {filename} dari GitHub Releases. Error: {e}")
+            st.error(f"❌ Gagal mengunduh {filename}. Error: {e}")
 
 # ==========================================
 # 3. PEMUATAN CLASS MAPPING
@@ -78,12 +87,13 @@ def load_class_mapping(json_path):
             with open(json_path, "r") as f:
                 raw_mapping = json.load(f)
             first_key = list(raw_mapping.keys())[0]
-            if first_key.isdigit():
+            if str(first_key).isdigit():
                 return {int(k): str(v) for k, v in raw_mapping.items()}
             else:
                 return {int(v): str(k) for k, v in raw_mapping.items()}
         except Exception:
             pass
+    # Fallback kelas default HAM10000
     return {
         0: "nv (Melanocytic nevi)",
         1: "mel (Melanoma)",
@@ -100,6 +110,7 @@ CLASS_NAMES = load_class_mapping(os.path.join(MODEL_DIR, "class_mapping.json"))
 # 4. PREPROCESSING & HELPER FUNCTIONS
 # ==========================================
 def apply_dullrazor(img_rgb):
+    """Algoritma penghilang rambut (DullRazor)."""
     gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
     blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
@@ -108,12 +119,14 @@ def apply_dullrazor(img_rgb):
     return clean, mask
 
 def apply_clahe(img_rgb):
+    """Algoritma penajaman kontras (CLAHE)."""
     lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return cv2.cvtColor(cv2.merge((clahe.apply(l), a, b)), cv2.COLOR_LAB2RGB)
 
 def get_last_spatial_layer(model):
+    """Mendapatkan layer spasial/konvolusi terakhir untuk XAI Target Layer."""
     spatial_layers = []
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Conv2d) or "stage" in name.lower() or "block" in name.lower():
@@ -121,7 +134,7 @@ def get_last_spatial_layer(model):
     return spatial_layers[-1] if spatial_layers else None
 
 # ==========================================
-# 5. MEMUAT MODEL (CACHED WITH VERIFICATION)
+# 5. MEMUAT MODEL (CACHED)
 # ==========================================
 @st.cache_resource
 def load_models():
@@ -131,20 +144,21 @@ def load_models():
     mamba_path = os.path.join(MODEL_DIR, "mambavision_best.pt")
     vminet_path = os.path.join(MODEL_DIR, "vminet_best.pt")
     
-    # Auto-download dengan verifikasi SHA-256
-    download_model_with_integrity_check(mamba_path, MAMBA_URL, MAMBA_SHA256)
-    download_model_with_integrity_check(vminet_path, VMINET_URL)
+    # 1. Download mambavision_best.pt dari GitHub Releases jika belum ada / sha256 beda
+    download_mambavision_model(mamba_path, MAMBA_URL, MAMBA_SHA256)
 
-    # 1. MambaVision Model
+    # 2. Inisialisasi Model MambaVision
     mamba = timm.create_model('mambaout_small.in1k', pretrained=False, num_classes=num_classes)
     if os.path.exists(mamba_path):
         mamba.load_state_dict(torch.load(mamba_path, map_location=device))
     mamba.to(device).eval()
 
-    # 2. VMINet Model
+    # 3. Inisialisasi Model VMINet (Dibaca langsung dari lokal models/vminet_best.pt)
     vminet = timm.create_model('efficientformerv2_s0', pretrained=False, num_classes=num_classes)
     if os.path.exists(vminet_path):
         vminet.load_state_dict(torch.load(vminet_path, map_location=device))
+    else:
+        st.warning(f"⚠️ File lokal '{vminet_path}' tidak ditemukan di folder models/.")
     vminet.to(device).eval()
 
     return mamba, vminet, device
@@ -247,7 +261,7 @@ with tab5:
         file_bytes = np.asarray(bytearray(inf_f.read()), dtype=np.uint8)
         raw_rgb = cv2.cvtColor(cv2.imdecode(file_bytes, 1), cv2.COLOR_BGR2RGB)
         
-        # Preprocessing
+        # Preprocessing Engine
         clean_rgb, _ = apply_dullrazor(raw_rgb)
         final_rgb = apply_clahe(clean_rgb)
         
@@ -258,7 +272,7 @@ with tab5:
         norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         tensor_norm = norm(tensor_in).to(device)
         
-        # Inferensi
+        # Inferensi Prediksi
         start = time.time()
         with torch.no_grad():
             outputs = act_model(tensor_norm)
@@ -270,7 +284,7 @@ with tab5:
         
         st.success(f"🔍 Prediksi: **{pred_label}** | Keyakinan: **{probs[p_idx]*100:.2f}%** | Latensi CPU: **{lat:.1f} ms**")
         
-        # Generate Map XAI
+        # Visualisasi Map XAI
         target_layer = get_last_spatial_layer(act_model)
         if target_layer:
             st.subheader("Peta Penjelasan Visual (XAI Heatmap)")
