@@ -23,8 +23,8 @@ MODEL_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
 # URL GitHub Release & Checksum SHA-256 untuk MambaVision
-# ⚠️ PASTIKAN USERNAME_ANDA DAN NAMA_REPO_ANDA SESUAI DENGAN GITHUB ANDA
-MAMBA_URL = "https://github.com/maksum-rois/VMINet-MambaVisionXAISkinLesion/releases/download/v1/mambavision_best.pt"
+# ⚠️ SESUAIKAN USERNAME_ANDA DAN NAMA_REPO_ANDA DENGAN REPOSITORY GITHUB ANDA
+MAMBA_URL = "https://github.com/USERNAME_ANDA/NAMA_REPO_ANDA/releases/download/v1.0.0/mambavision_best.pt"
 MAMBA_SHA256 = "2363e55448f8d8a1a998c9db95a21bf538a7dc7d7522004e7425ff9ef6c604aa"
 
 st.set_page_config(
@@ -93,7 +93,6 @@ def load_class_mapping(json_path):
                 return {int(v): str(k) for k, v in raw_mapping.items()}
         except Exception:
             pass
-    # Fallback kelas default HAM10000
     return {
         0: "nv (Melanocytic nevi)",
         1: "mel (Melanoma)",
@@ -133,6 +132,13 @@ def get_last_spatial_layer(model):
             spatial_layers.append(module)
     return spatial_layers[-1] if spatial_layers else None
 
+# Pipeline Transformasi Standar PyTorch
+inference_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
 # ==========================================
 # 5. MEMUAT MODEL (CACHED)
 # ==========================================
@@ -144,7 +150,7 @@ def load_models():
     mamba_path = os.path.join(MODEL_DIR, "mambavision_best.pt")
     vminet_path = os.path.join(MODEL_DIR, "vminet_best.pt")
     
-    # 1. Download mambavision_best.pt dari GitHub Releases jika belum ada / sha256 beda
+    # 1. Download mambavision_best.pt dari GitHub Releases jika belum ada
     download_mambavision_model(mamba_path, MAMBA_URL, MAMBA_SHA256)
 
     # 2. Inisialisasi Model MambaVision
@@ -252,6 +258,11 @@ with tab5:
     col_sel, col_up = st.columns([1, 2])
     with col_sel:
         m_choice = st.selectbox("Pilih Model Arsitektur:", ["MambaVision", "VMINet"])
+        use_preprocessing = st.checkbox(
+            "Aktifkan Preprocessing (DullRazor + CLAHE)", 
+            value=False,
+            help="Nonaktifkan opsi ini jika citra asli sudah bersih atau jika model memberikan prediksi ragu akibat penajaman CLAHE."
+        )
     with col_up:
         inf_f = st.file_uploader("Unggah Citra Dermoskopi Pasien:", type=["jpg", "png", "jpeg"], key="l_up")
         
@@ -261,28 +272,43 @@ with tab5:
         file_bytes = np.asarray(bytearray(inf_f.read()), dtype=np.uint8)
         raw_rgb = cv2.cvtColor(cv2.imdecode(file_bytes, 1), cv2.COLOR_BGR2RGB)
         
-        # Preprocessing Engine
-        clean_rgb, _ = apply_dullrazor(raw_rgb)
-        final_rgb = apply_clahe(clean_rgb)
+        # Penanganan Opsi Preprocessing
+        if use_preprocessing:
+            clean_rgb, _ = apply_dullrazor(raw_rgb)
+            final_rgb = apply_clahe(clean_rgb)
+        else:
+            final_rgb = raw_rgb
         
-        # Tensor Transformation
-        pil_img = Image.fromarray(final_rgb).resize((224, 224))
-        img_arr = np.array(pil_img) / 255.0
-        tensor_in = torch.tensor(img_arr, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
-        norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        tensor_norm = norm(tensor_in).to(device)
+        # Transformasi Tensor
+        input_pil = Image.fromarray(final_rgb)
+        tensor_norm = inference_transform(input_pil).unsqueeze(0).to(device)
         
         # Inferensi Prediksi
         start = time.time()
         with torch.no_grad():
             outputs = act_model(tensor_norm)
-            probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
+            probs_all = torch.softmax(outputs, dim=1)
+            topk_probs, topk_indices = torch.topk(probs_all, k=min(3, len(CLASS_NAMES)))
+            topk_probs = topk_probs.cpu().numpy()[0]
+            topk_indices = topk_indices.cpu().numpy()[0]
         lat = (time.time() - start) * 1000
         
-        p_idx = int(np.argmax(probs))
-        pred_label = CLASS_NAMES.get(p_idx, f"Class {p_idx}")
+        top_idx = topk_indices[0]
+        pred_label = CLASS_NAMES.get(top_idx, f"Class {top_idx}")
+        top_prob_pct = topk_probs[0] * 100
         
-        st.success(f"🔍 Prediksi: **{pred_label}** | Keyakinan: **{probs[p_idx]*100:.2f}%** | Latensi CPU: **{lat:.1f} ms**")
+        st.success(f"🔍 Prediksi Utama: **{pred_label}** | Keyakinan: **{top_prob_pct:.2f}%** | Latensi CPU: **{lat:.1f} ms**")
+        
+        # Warning jika probabilitas rendah
+        if top_prob_pct < 40.0:
+            st.warning("⚠️ **Keyakinan Rendah (<40%):** Model mengalami ketidakpastian tinggi pada sampel ini. Periksa daftar Top-3 di bawah atau coba ubah status checkbox Preprocessing.")
+            
+        st.markdown("**Top-3 Probabilitas Diagnosis:**")
+        for i in range(len(topk_indices)):
+            idx = topk_indices[i]
+            lbl = CLASS_NAMES.get(idx, f"Class {idx}")
+            pr = topk_probs[i] * 100
+            st.write(f"{i+1}. **{lbl}**: {pr:.2f}%")
         
         # Visualisasi Map XAI
         target_layer = get_last_spatial_layer(act_model)
@@ -290,14 +316,16 @@ with tab5:
             st.subheader("Peta Penjelasan Visual (XAI Heatmap)")
             
             try:
+                img_float = np.float32(input_pil.resize((224, 224))) / 255.0
+                
                 gpp = GradCAMPlusPlus(model=act_model, target_layers=[target_layer])
-                vis_gpp = show_cam_on_image(np.float32(pil_img)/255.0, gpp(input_tensor=tensor_norm)[0, :], use_rgb=True)
+                vis_gpp = show_cam_on_image(img_float, gpp(input_tensor=tensor_norm)[0, :], use_rgb=True)
                 
                 sc = ScoreCAM(model=act_model, target_layers=[target_layer])
-                vis_sc = show_cam_on_image(np.float32(pil_img)/255.0, sc(input_tensor=tensor_norm)[0, :], use_rgb=True)
+                vis_sc = show_cam_on_image(img_float, sc(input_tensor=tensor_norm)[0, :], use_rgb=True)
                 
                 xa, xb, xc = st.columns(3)
-                xa.image(final_rgb, caption="Hasil Preprocessing", use_container_width=True)
+                xa.image(final_rgb, caption="Input Gambar ke Model", use_container_width=True)
                 xb.image(vis_gpp, caption="Grad-CAM++ Heatmap", use_container_width=True)
                 xc.image(vis_sc, caption="Score-CAM Heatmap", use_container_width=True)
             except Exception as e:
