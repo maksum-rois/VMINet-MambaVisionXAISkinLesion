@@ -23,10 +23,10 @@ MODEL_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
 # URL GitHub Release & SHA256 Hash
-MAMBA_URL = "https://github.com/USERNAME_ANDA/skin-lesion-xai-app/releases/download/v1.0.0/mambavision_best.pt"
+MAMBA_URL = "https://github.com/maksum-rois/VMINet-MambaVisionXAISkinLesion/releases/download/v1.0.0/mambavision_best.pt"
 MAMBA_SHA256 = "2363e55448f8d8a1a998c9db95a21bf538a7dc7d7522004e7425ff9ef6c604aa"
 
-VMINET_URL = "https://github.com/USERNAME_ANDA/skin-lesion-xai-app/releases/download/v1.0.0/vminet_best.pt"
+VMINET_URL = "https://github.com/maksum-rois/VMINet-MambaVisionXAISkinLesion/releases/download/v1.0.0/vminet_best.pt"
 
 st.set_page_config(
     page_title="Skin Lesion XAI Framework",
