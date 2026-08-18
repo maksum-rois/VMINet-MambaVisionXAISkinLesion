@@ -1,11 +1,9 @@
-streamlit>=1.30.0
-torch>=2.0.0
-torchvision>=0.15.0
-timm>=0.9.12
+streamlit
+torch
+torchvision
+timm
 opencv-python-headless
 numpy
 pandas
-matplotlib
 pillow
 grad-cam
-lime
