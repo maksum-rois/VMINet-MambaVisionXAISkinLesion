@@ -1,0 +1,3 @@
+Model,Accuracy (%),Balanced Accuracy (%),Macro F1-Score,Macro ROC-AUC,CPU Latency (ms),Peak RAM (MB),Model Size (MB)
+MambaVision,85.4,81.2,0.82,0.93,84.2,412.5,54.2
+VMINet,83.2,79.8,0.8,0.91,62.1,310.8,28.5
