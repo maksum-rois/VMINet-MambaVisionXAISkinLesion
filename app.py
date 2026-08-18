@@ -2,6 +2,7 @@ import os
 import json
 import time
 import cv2
+import gc
 import torch
 import timm
 import hashlib
@@ -35,6 +36,8 @@ st.set_page_config(
 
 st.title("🔬 Framework Klasifikasi Lesi Kulit Berbasis Mamba & XAI")
 st.caption("Integrasi MambaVision/VMINet, Preprocessing DullRazor+CLAHE, dan Visual XAI (Grad-CAM++, Score-CAM)")
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ==========================================
 # 2. VERIFIKASI HASH & DOWNLOAD MAMBAVISION
@@ -140,36 +143,34 @@ inference_transform = transforms.Compose([
 ])
 
 # ==========================================
-# 5. MEMUAT MODEL (CACHED)
+# 5. MEMUAT MODEL SECARA LAZY & OPTIMAL (RAM FREE)
 # ==========================================
-@st.cache_resource
-def load_models():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    num_classes = len(CLASS_NAMES)
-    
+@st.cache_resource(max_entries=1)
+def load_mamba_model():
+    """Memuat model MambaVision secara dinamis (maksimal 1 model aktif di RAM)."""
+    gc.collect()
     mamba_path = os.path.join(MODEL_DIR, "mambavision_best.pt")
-    vminet_path = os.path.join(MODEL_DIR, "vminet_best.pt")
-    
-    # 1. Download mambavision_best.pt dari GitHub Releases jika belum ada
     download_mambavision_model(mamba_path, MAMBA_URL, MAMBA_SHA256)
 
-    # 2. Inisialisasi Model MambaVision
-    mamba = timm.create_model('mambaout_small.in1k', pretrained=False, num_classes=num_classes)
+    mamba = timm.create_model('mambaout_small.in1k', pretrained=False, num_classes=len(CLASS_NAMES))
     if os.path.exists(mamba_path):
         mamba.load_state_dict(torch.load(mamba_path, map_location=device))
     mamba.to(device).eval()
+    return mamba
 
-    # 3. Inisialisasi Model VMINet (Dibaca langsung dari lokal models/vminet_best.pt)
-    vminet = timm.create_model('efficientformerv2_s0', pretrained=False, num_classes=num_classes)
+@st.cache_resource(max_entries=1)
+def load_vminet_model():
+    """Memuat model VMINet secara dinamis (maksimal 1 model aktif di RAM)."""
+    gc.collect()
+    vminet_path = os.path.join(MODEL_DIR, "vminet_best.pt")
+
+    vminet = timm.create_model('efficientformerv2_s0', pretrained=False, num_classes=len(CLASS_NAMES))
     if os.path.exists(vminet_path):
         vminet.load_state_dict(torch.load(vminet_path, map_location=device))
     else:
         st.warning(f"⚠️ File lokal '{vminet_path}' tidak ditemukan di folder models/.")
     vminet.to(device).eval()
-
-    return mamba, vminet, device
-
-model_mamba, model_vminet, device = load_models()
+    return vminet
 
 # ==========================================
 # 6. STRUKTUR 5 TAB PENELITIAN
@@ -267,12 +268,16 @@ with tab5:
         inf_f = st.file_uploader("Unggah Citra Dermoskopi Pasien:", type=["jpg", "png", "jpeg"], key="l_up")
         
     if inf_f:
-        act_model = model_mamba if m_choice == "MambaVision" else model_vminet
+        # Load model secara dinamis sesuai pilihan (Hanya 1 model di RAM)
+        if m_choice == "MambaVision":
+            act_model = load_mamba_model()
+        else:
+            act_model = load_vminet_model()
         
         file_bytes = np.asarray(bytearray(inf_f.read()), dtype=np.uint8)
         raw_rgb = cv2.cvtColor(cv2.imdecode(file_bytes, 1), cv2.COLOR_BGR2RGB)
         
-        # Penanganan Opsi Preprocessing
+        # Opsi Preprocessing
         if use_preprocessing:
             clean_rgb, _ = apply_dullrazor(raw_rgb)
             final_rgb = apply_clahe(clean_rgb)
@@ -310,23 +315,34 @@ with tab5:
             pr = topk_probs[i] * 100
             st.write(f"{i+1}. **{lbl}**: {pr:.2f}%")
         
-        # Visualisasi Map XAI
-        target_layer = get_last_spatial_layer(act_model)
-        if target_layer:
-            st.subheader("Peta Penjelasan Visual (XAI Heatmap)")
-            
-            try:
-                img_float = np.float32(input_pil.resize((224, 224))) / 255.0
-                
-                gpp = GradCAMPlusPlus(model=act_model, target_layers=[target_layer])
-                vis_gpp = show_cam_on_image(img_float, gpp(input_tensor=tensor_norm)[0, :], use_rgb=True)
-                
-                sc = ScoreCAM(model=act_model, target_layers=[target_layer])
-                vis_sc = show_cam_on_image(img_float, sc(input_tensor=tensor_norm)[0, :], use_rgb=True)
-                
-                xa, xb, xc = st.columns(3)
-                xa.image(final_rgb, caption="Input Gambar ke Model", use_container_width=True)
-                xb.image(vis_gpp, caption="Grad-CAM++ Heatmap", use_container_width=True)
-                xc.image(vis_sc, caption="Score-CAM Heatmap", use_container_width=True)
-            except Exception as e:
-                st.warning(f"Gagal memuat peta XAI: {str(e)}")
+        st.divider()
+        
+        # Visualisasi Map XAI On-Demand (Guna Menghemat RAM)
+        st.subheader("Peta Penjelasan Visual (XAI Heatmap)")
+        
+        if st.button("🚀 Generasi Heatmap XAI (Grad-CAM++ & Score-CAM)"):
+            target_layer = get_last_spatial_layer(act_model)
+            if target_layer:
+                with st.spinner("Mengolah Peta Visual XAI... Mohon tunggu sebentar."):
+                    try:
+                        img_float = np.float32(input_pil.resize((224, 224))) / 255.0
+                        
+                        # Generasi Grad-CAM++
+                        gpp = GradCAMPlusPlus(model=act_model, target_layers=[target_layer])
+                        vis_gpp = show_cam_on_image(img_float, gpp(input_tensor=tensor_norm)[0, :], use_rgb=True)
+                        del gpp  # Hapus instance untuk melepaskan RAM
+                        
+                        # Generasi Score-CAM (Batch Size = 1)
+                        sc = ScoreCAM(model=act_model, target_layers=[target_layer])
+                        vis_sc = show_cam_on_image(img_float, sc(input_tensor=tensor_norm, batch_size=1)[0, :], use_rgb=True)
+                        del sc   # Hapus instance untuk melepaskan RAM
+                        
+                        # Paksa pembersihan memori Python
+                        gc.collect()
+                        
+                        xa, xb, xc = st.columns(3)
+                        xa.image(final_rgb, caption="Input Gambar ke Model", use_container_width=True)
+                        xb.image(vis_gpp, caption="Grad-CAM++ Heatmap", use_container_width=True)
+                        xc.image(vis_sc, caption="Score-CAM Heatmap", use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Gagal memuat peta XAI: {str(e)}")
